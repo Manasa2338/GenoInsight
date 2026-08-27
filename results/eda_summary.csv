@@ -1,0 +1,2 @@
+samples,genes,cancer_classes,minimum_expression,maximum_expression,mean_expression,median_expression,zero_percentage,genes_over_70_percent_zero,genes_over_80_percent_zero,genes_over_90_percent_zero,pc1_variance,pc2_variance,pc1_pc2_variance,missing_values,duplicate_samples,duplicate_genes
+801,20531,5,0.0,20.7788287118,6.443322266573218,7.60958507388,14.21755512248431,2109,1742,1259,0.10539781350598719,0.08754232469325417,0.19294013819924136,0,0,0

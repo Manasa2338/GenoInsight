@@ -1,0 +1,6 @@
+Cancer,Top_10_SHAP_Genes
+BRCA,"gene_17801, gene_7964, gene_5578, gene_15999, gene_6611, gene_2747, gene_18746, gene_6876, gene_17287, gene_6748"
+COAD,"gene_10460, gene_3523, gene_12013, gene_5829, gene_2037, gene_7238, gene_5830, gene_15983, gene_17837, gene_7560"
+KIRC,"gene_3439, gene_6733, gene_18, gene_13818, gene_12977, gene_8801, gene_1858, gene_12078, gene_16246, gene_1510"
+LUAD,"gene_15895, gene_11903, gene_15898, gene_19542, gene_15161, gene_9544, gene_15896, gene_15577, gene_15591, gene_15894"
+PRAD,"gene_9175, gene_18135, gene_17664, gene_9176, gene_1096, gene_3737, gene_17751, gene_16358, gene_12069, gene_11910"

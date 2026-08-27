@@ -1,0 +1,6 @@
+Class,Encoded_Value
+BRCA,0
+COAD,1
+KIRC,2
+LUAD,3
+PRAD,4

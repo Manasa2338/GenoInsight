@@ -1,0 +1,13 @@
+{
+    "original_samples": 801,
+    "original_genes": 20531,
+    "training_samples": 560,
+    "validation_samples": 120,
+    "test_samples": 121,
+    "zero_threshold": 0.7,
+    "original_gene_count": 20531,
+    "retained_gene_count": 18430,
+    "removed_gene_count": 2101,
+    "scaling": "StandardScaler",
+    "random_state": 42
+}
