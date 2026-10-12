@@ -1,0 +1,2 @@
+accuracy,macro_precision,macro_recall,macro_f1,macro_roc_auc,vae_training_seconds,dnn_training_seconds,latent_dimension
+0.9834710743801653,0.9714285714285715,0.986031746031746,0.9774901448236608,1.0,32.776970624923706,0.8479220867156982,64
