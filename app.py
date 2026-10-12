@@ -1,11 +1,12 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
 import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 
 from pathlib import Path
-
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -17,124 +18,118 @@ st.set_page_config(
     layout="wide"
 )
 
-
-# ============================================================
-# PATHS
-# ============================================================
-
 BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "results_vae_dnn"
+EXPLAIN_DIR = MODEL_DIR / "explainability"
+DATA_DIR = BASE_DIR / "data" / "processed"
 
-MODEL_PATH = BASE_DIR / "results" / "best_model.pkl"
-SCALER_PATH = BASE_DIR / "models" / "scaler.pkl"
-SELECTED_FEATURES_PATH = (
-    BASE_DIR / "data" / "processed" / "selected_features.csv"
-)
-CLASS_MAPPING_PATH = (
-    BASE_DIR / "results" / "class_mapping.csv"
-)
+VAE_PATH = MODEL_DIR / "vae_model.pt"
+DNN_PATH = MODEL_DIR / "dnn_model.pt"
+SCALER_PATH = MODEL_DIR / "scaler.pkl"
+ENCODER_PATH = MODEL_DIR / "label_encoder.pkl"
 
-RESULTS_DIR = BASE_DIR / "results"
+FEATURES_PATH = DATA_DIR / "X_train_selected.csv"
+
+DEVICE = torch.device("cpu")
+LATENT_DIM = 64
+
+# ============================================================
+# MODEL ARCHITECTURES
+# Must match train_vae_dnn.py exactly
+# ============================================================
+
+class VAE(nn.Module):
+    def __init__(self, input_dim=5000, latent_dim=64):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 256),
+            nn.ReLU()
+        )
+
+        self.mu = nn.Linear(256, latent_dim)
+        self.logvar = nn.Linear(256, latent_dim)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, input_dim)
+        )
+
+    def encode(self, x):
+        hidden = self.encoder(x)
+        return self.mu(hidden), self.logvar(hidden)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        return mu, logvar
+
+
+class DNN(nn.Module):
+    def __init__(self, input_dim=64, num_classes=5):
+        super().__init__()
+
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, num_classes)
+        )
+
+    def forward(self, x):
+        return self.network(x)
 
 
 # ============================================================
-# SESSION STATE
-# ============================================================
-
-if "data_loaded" not in st.session_state:
-    st.session_state.data_loaded = False
-
-if "X_original" not in st.session_state:
-    st.session_state.X_original = None
-
-if "X_selected" not in st.session_state:
-    st.session_state.X_selected = None
-
-if "X_scaled" not in st.session_state:
-    st.session_state.X_scaled = None
-
-if "predictions" not in st.session_state:
-    st.session_state.predictions = None
-
-if "probabilities" not in st.session_state:
-    st.session_state.probabilities = None
-
-if "uploaded_name" not in st.session_state:
-    st.session_state.uploaded_name = None
-
-if "sample_index" not in st.session_state:
-    st.session_state.sample_index = 0
-
-
-# ============================================================
-# LOAD MODEL
+# LOAD TRAINED OBJECTS
 # ============================================================
 
 @st.cache_resource
-def load_model():
+def load_objects():
+    import joblib
 
-    if not MODEL_PATH.exists():
-        return None
+    required = [
+        VAE_PATH, DNN_PATH, SCALER_PATH,
+        ENCODER_PATH, FEATURES_PATH
+    ]
 
-    return joblib.load(MODEL_PATH)
+    missing = [str(p) for p in required if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Required files are missing:\n" + "\n".join(missing)
+        )
 
+    feature_df = pd.read_csv(FEATURES_PATH)
+    feature_df = feature_df.loc[
+        :, ~feature_df.columns.astype(str).str.startswith("Unnamed:")
+    ]
 
-# ============================================================
-# LOAD SCALER
-# ============================================================
+    feature_names = feature_df.columns.astype(str).tolist()
 
-@st.cache_resource
-def load_scaler():
+    scaler = joblib.load(SCALER_PATH)
+    label_encoder = joblib.load(ENCODER_PATH)
 
-    if not SCALER_PATH.exists():
-        return None
+    vae = VAE(input_dim=len(feature_names), latent_dim=LATENT_DIM)
+    dnn = DNN(input_dim=LATENT_DIM, num_classes=len(label_encoder.classes_))
 
-    return joblib.load(SCALER_PATH)
+    vae.load_state_dict(
+        torch.load(VAE_PATH, map_location=DEVICE, weights_only=True)
+    )
+    dnn.load_state_dict(
+        torch.load(DNN_PATH, map_location=DEVICE, weights_only=True)
+    )
 
+    vae.to(DEVICE).eval()
+    dnn.to(DEVICE).eval()
 
-# ============================================================
-# LOAD SELECTED GENES
-# ============================================================
-
-@st.cache_data
-def load_selected_genes():
-
-    if not SELECTED_FEATURES_PATH.exists():
-        return []
-
-    df = pd.read_csv(SELECTED_FEATURES_PATH)
-
-    if "gene" not in df.columns:
-        return []
-
-    return df["gene"].astype(str).tolist()
-
-
-# ============================================================
-# LOAD CLASS MAPPING
-# ============================================================
-
-@st.cache_data
-def load_classes():
-
-    if not CLASS_MAPPING_PATH.exists():
-        return ["BRCA", "COAD", "KIRC", "LUAD", "PRAD"]
-
-    df = pd.read_csv(CLASS_MAPPING_PATH)
-
-    if "Class" in df.columns:
-        return df["Class"].astype(str).tolist()
-
-    return ["BRCA", "COAD", "KIRC", "LUAD", "PRAD"]
-
-
-# ============================================================
-# LOAD OBJECTS
-# ============================================================
-
-model = load_model()
-scaler = load_scaler()
-selected_genes = load_selected_genes()
-classes = load_classes()
+    return vae, dnn, scaler, label_encoder, feature_names
 
 
 # ============================================================
@@ -142,90 +137,79 @@ classes = load_classes()
 # ============================================================
 
 st.title("🧬 GenoInsight")
-
-st.subheader(
-    "Explainable AI for RNA-Seq Cancer Prediction"
-)
+st.subheader("Explainable AI for RNA-Seq Cancer Prediction")
 
 st.write(
-    """
-GenoInsight uses machine learning to predict cancer type from
-RNA-Seq gene expression data and provides explainable predictions
-using SHAP.
-"""
+    "GenoInsight uses a Variational Autoencoder (VAE) and "
+    "Deep Neural Network (DNN) to classify RNA-Seq expression "
+    "profiles into five cancer classes, with Integrated Gradients "
+    "for model-level explanations."
 )
 
+try:
+    vae, dnn, scaler, label_encoder, selected_genes = load_objects()
+    classes = [str(c) for c in label_encoder.classes_]
+except Exception as e:
+    st.error(f"Could not load the VAE + DNN model: {e}")
+    st.stop()
 
 # ============================================================
 # MODEL INFORMATION
 # ============================================================
 
+metrics_path = MODEL_DIR / "test_metrics.csv"
+
 st.header("📊 Model Information")
 
-col1, col2, col3, col4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-with col1:
-    st.metric(
-        "Selected Genes",
-        "5,000"
-    )
+c1.metric("Selected Features", f"{len(selected_genes):,}")
+c2.metric("Cancer Classes", len(classes))
+c3.metric("Latent Dimensions", LATENT_DIM)
 
-with col2:
-    st.metric(
-        "Cancer Classes",
-        "5"
-    )
+if metrics_path.exists():
+    metrics = pd.read_csv(metrics_path).iloc[0]
+    c4.metric("Test Accuracy", f"{metrics['accuracy'] * 100:.2f}%")
+    st.metric("Test Macro F1", f"{metrics['macro_f1']:.4f}")
+else:
+    c4.metric("Test Accuracy", "Not available")
 
-with col3:
-    st.metric(
-        "Test Accuracy",
-        "99.17%"
-    )
-
-with col4:
-    st.metric(
-        "Test Macro F1",
-        "99.29%"
-    )
-
-
-st.info(
-    "Model: Elastic Net Logistic Regression"
-)
-
+st.info("Active model: Variational Autoencoder (VAE) + Deep Neural Network (DNN)")
 
 # ============================================================
-# CHECK REQUIRED FILES
+# FEATURE ATTRIBUTION
+# Integrated Gradients through VAE latent means and DNN logits
 # ============================================================
 
-if model is None:
+def integrated_gradients(x, target_class, steps=32):
+    """
+    x: one already-scaled sample with shape (1, 5000).
+    Baseline: zero in standardized feature space.
+    Attribution target: selected class logit.
+    """
+    baseline = torch.zeros_like(x)
+    difference = x - baseline
+    total_gradients = torch.zeros_like(x)
 
-    st.error(
-        f"Model not found:\n{MODEL_PATH}"
-    )
-    st.stop()
+    for alpha in torch.linspace(0, 1, steps, device=DEVICE):
+        interpolated = (
+            baseline + alpha * difference
+        ).detach().requires_grad_(True)
 
+        mu, _ = vae.encode(interpolated)
+        logits = dnn(mu)
 
-if scaler is None:
+        score = logits[0, target_class]
+        gradients = torch.autograd.grad(
+            score, interpolated, retain_graph=False
+        )[0]
 
-    st.error(
-        f"Scaler not found:\n{SCALER_PATH}"
-    )
-    st.stop()
+        total_gradients += gradients.detach()
 
+    average_gradients = total_gradients / steps
+    attributions = difference * average_gradients
 
-if len(selected_genes) == 0:
-
-    st.error(
-        f"Selected genes not found:\n"
-        f"{SELECTED_FEATURES_PATH}"
-    )
-    st.stop()
-
-
-st.success(
-    "✓ Model, scaler and selected genes loaded."
-)
+    return attributions.detach().cpu().numpy().flatten()
 
 
 # ============================================================
@@ -235,821 +219,286 @@ st.success(
 st.header("📁 Upload RNA-Seq Dataset")
 
 uploaded_file = st.file_uploader(
-    "Upload CSV file",
-    type=["csv"],
-    key="rna_upload"
+    "Upload a CSV containing RNA-Seq expression values",
+    type=["csv"]
 )
 
-
-# ============================================================
-# PROCESS UPLOADED FILE
-# ============================================================
-
-if uploaded_file is not None:
-
-    # Process ONLY when a new file is uploaded
-    if (
-        st.session_state.uploaded_name
-        != uploaded_file.name
-    ):
-
-        with st.spinner(
-            "Loading and processing RNA-Seq dataset..."
-        ):
-
-            try:
-
-                df = pd.read_csv(uploaded_file)
-
-                # --------------------------------------------
-                # SAVE ORIGINAL DATA
-                # --------------------------------------------
-
-                st.session_state.X_original = df.copy()
-
-                # --------------------------------------------
-                # REMOVE SAMPLE ID COLUMN
-                # --------------------------------------------
-
-                if "Unnamed: 0" in df.columns:
-                    expression_df = df.drop(
-                        columns=["Unnamed: 0"]
-                    )
-                else:
-                    expression_df = df.copy()
-
-                # --------------------------------------------
-                # CHECK SELECTED GENES
-                # --------------------------------------------
-
-                missing_genes = [
-                    gene
-                    for gene in selected_genes
-                    if gene not in expression_df.columns
-                ]
-
-                if len(missing_genes) > 0:
-
-                    st.error(
-                        f"❌ {len(missing_genes)} selected genes "
-                        "are missing from the uploaded dataset."
-                    )
-
-                    st.write(
-                        "First missing genes:"
-                    )
-
-                    st.write(
-                        missing_genes[:20]
-                    )
-
-                    st.session_state.data_loaded = False
-                    st.stop()
-
-                # --------------------------------------------
-                # SELECT 5,000 GENES
-                # --------------------------------------------
-
-                X_selected = expression_df[
-                    selected_genes
-                ].copy()
-
-                # --------------------------------------------
-                # CONVERT TO NUMERIC
-                # --------------------------------------------
-
-                X_selected = X_selected.apply(
-                    pd.to_numeric,
-                    errors="coerce"
-                )
-
-                # --------------------------------------------
-                # CHECK MISSING VALUES
-                # --------------------------------------------
-
-                if X_selected.isnull().sum().sum() > 0:
-
-                    st.error(
-                        "❌ Non-numeric or missing values "
-                        "were found in selected genes."
-                    )
-
-                    st.stop()
-
-                # --------------------------------------------
-                # SCALE USING TRAINING SCALER
-                # --------------------------------------------
-
-                X_scaled_array = scaler.transform(
-                    X_selected
-                )
-
-                X_scaled = pd.DataFrame(
-                    X_scaled_array,
-                    columns=selected_genes,
-                    index=X_selected.index
-                )
-
-                # --------------------------------------------
-                # PREDICTION
-                # --------------------------------------------
-
-                predictions_encoded = model.predict(
-                    X_scaled
-                )
-
-                # --------------------------------------------
-                # CONVERT NUMERIC PREDICTIONS TO NAMES
-                # --------------------------------------------
-
-                prediction_names = []
-
-                for prediction in predictions_encoded:
-
-                    prediction = int(prediction)
-
-                    if prediction < len(classes):
-
-                        prediction_names.append(
-                            classes[prediction]
-                        )
-
-                    else:
-
-                        prediction_names.append(
-                            str(prediction)
-                        )
-
-                # --------------------------------------------
-                # PROBABILITIES
-                # --------------------------------------------
-
-                probabilities = model.predict_proba(
-                    X_scaled
-                )
-
-                # --------------------------------------------
-                # SAVE EVERYTHING TO SESSION STATE
-                # --------------------------------------------
-
-                st.session_state.X_selected = X_selected
-
-                st.session_state.X_scaled = X_scaled
-
-                st.session_state.predictions = (
-                    prediction_names
-                )
-
-                st.session_state.probabilities = (
-                    probabilities
-                )
-
-                st.session_state.uploaded_name = (
-                    uploaded_file.name
-                )
-
-                st.session_state.data_loaded = True
-
-                st.session_state.sample_index = 0
-
-            except Exception as e:
-
-                st.error(
-                    f"Error while processing dataset:\n{e}"
-                )
-
-                st.session_state.data_loaded = False
-
-
-# ============================================================
-# DISPLAY RESULTS
-# ============================================================
-
-if st.session_state.data_loaded:
-
-    X_original = st.session_state.X_original
-    X_selected = st.session_state.X_selected
-    predictions = st.session_state.predictions
-    probabilities = st.session_state.probabilities
-
-
-    # ========================================================
-    # DATASET INFORMATION
-    # ========================================================
-
-    st.header("📊 Dataset Information")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "Samples",
-            X_selected.shape[0]
-        )
-
-    with col2:
-        st.metric(
-            "Original Columns",
-            X_original.shape[1]
-        )
-
-    with col3:
-        st.metric(
-            "Required Genes",
-            len(selected_genes)
-        )
-
-
-    # ========================================================
-    # DATASET PREVIEW
-    # ========================================================
-
-    st.header("👀 Dataset Preview")
-
-    st.dataframe(
-        X_original.head(10),
-        use_container_width=True
+if uploaded_file is None:
+    st.info("Upload a CSV file to begin prediction.")
+    st.stop()
+
+try:
+    raw_df = pd.read_csv(uploaded_file)
+
+    expression_df = raw_df.drop(
+        columns=[
+            c for c in raw_df.columns
+            if str(c).startswith("Unnamed:")
+        ],
+        errors="ignore"
     )
 
-
-    # ========================================================
-    # GENE VALIDATION
-    # ========================================================
-
-    st.header("🧬 Gene Validation")
-
+    # Keep only the selected features, in training order.
     missing = [
-        gene
-        for gene in selected_genes
-        if gene not in X_original.columns
+        gene for gene in selected_genes
+        if gene not in expression_df.columns
     ]
 
-    if len(missing) == 0:
-
-        st.success(
-            "✓ All 5,000 selected genes are present."
-        )
-
-    else:
-
+    if missing:
         st.error(
-            f"❌ Missing genes: {len(missing)}"
+            f"{len(missing)} required selected features are missing. "
+            "Upload data containing the original gene_XXXXX columns "
+            "or the exact 5,000 selected features used during training."
+        )
+        st.write("Examples of missing features:", missing[:20])
+        st.stop()
+
+    X_selected = expression_df[selected_genes].apply(
+        pd.to_numeric, errors="coerce"
+    )
+
+    if X_selected.isna().any().any():
+        st.error(
+            "Selected features contain missing or non-numeric values. "
+            "Please clean the input CSV and upload it again."
+        )
+        st.stop()
+
+    if not np.isfinite(X_selected.to_numpy(dtype=np.float64)).all():
+        st.error("Selected features contain infinite values.")
+        st.stop()
+
+    X_scaled = scaler.transform(X_selected).astype(np.float32)
+
+    with torch.no_grad():
+        x_tensor = torch.tensor(X_scaled, dtype=torch.float32, device=DEVICE)
+        mu, _ = vae.encode(x_tensor)
+        logits = dnn(mu)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+        pred_ids = probs.argmax(axis=1)
+
+    predictions = label_encoder.inverse_transform(pred_ids)
+
+except Exception as e:
+    st.error(f"Error processing uploaded dataset: {e}")
+    st.stop()
+
+# ============================================================
+# DATASET SUMMARY
+# ============================================================
+
+st.header("📊 Dataset Information")
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Samples", X_selected.shape[0])
+c2.metric("Uploaded Columns", raw_df.shape[1])
+c3.metric("Selected Features Used", len(selected_genes))
+
+with st.expander("Preview uploaded data"):
+    st.dataframe(raw_df.head(10), use_container_width=True)
+
+# ============================================================
+# PREDICTIONS
+# ============================================================
+
+st.header("🔬 Cancer Prediction")
+st.success(f"Predictions completed for {len(predictions)} samples.")
+
+result_df = pd.DataFrame({
+    "Sample": [f"Sample {i}" for i in range(len(predictions))],
+    "Predicted Cancer": predictions
+})
+
+for i, cancer in enumerate(classes):
+    result_df[f"Probability_{cancer} (%)"] = np.round(probs[:, i] * 100, 2)
+
+st.dataframe(result_df, use_container_width=True, height=300)
+
+st.download_button(
+    "Download prediction results",
+    data=result_df.to_csv(index=False).encode("utf-8"),
+    file_name="genoinsight_predictions.csv",
+    mime="text/csv"
+)
+
+# ============================================================
+# PREDICTION SUMMARY
+# ============================================================
+
+st.header("📈 Predicted Cancer Distribution")
+
+counts = pd.Series(predictions).value_counts().reindex(classes, fill_value=0)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(counts.index, counts.values)
+ax.set_xlabel("Cancer Class")
+ax.set_ylabel("Number of Samples")
+ax.set_title("Predicted Cancer Distribution")
+st.pyplot(fig, clear_figure=True)
+plt.close(fig)
+
+# ============================================================
+# INDIVIDUAL SAMPLE EXPLANATION
+# ============================================================
+
+st.header("🧠 Individual Sample Explanation")
+
+sample_index = st.selectbox(
+    "Select a sample",
+    range(len(predictions)),
+    format_func=lambda i: f"Sample {i}"
+)
+
+predicted_class = str(predictions[sample_index])
+predicted_id = int(pred_ids[sample_index])
+
+st.subheader(f"Sample {sample_index}")
+c1, c2 = st.columns(2)
+c1.metric("Predicted Cancer Class", predicted_class)
+c2.metric(
+    "Top Class Probability",
+    f"{probs[sample_index, predicted_id] * 100:.2f}%"
+)
+
+st.caption(
+    "These are model probabilities, not calibrated clinical probabilities "
+    "or a medical diagnosis."
+)
+
+st.subheader("Class Probabilities")
+
+probability_df = pd.DataFrame({
+    "Cancer Class": classes,
+    "Probability (%)": np.round(probs[sample_index] * 100, 2)
+}).sort_values("Probability (%)", ascending=False)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(
+    probability_df["Cancer Class"],
+    probability_df["Probability (%)"]
+)
+ax.set_ylabel("Probability (%)")
+ax.set_ylim(0, 100)
+ax.set_title(f"Class Probabilities — Sample {sample_index}")
+st.pyplot(fig, clear_figure=True)
+plt.close(fig)
+
+st.dataframe(probability_df, use_container_width=True, hide_index=True)
+
+# ============================================================
+# INTEGRATED GRADIENTS
+# ============================================================
+
+st.subheader("Integrated Gradients: Top Influential Features")
+
+st.write(
+    "Attributions explain how input features affect the selected "
+    "class logit relative to a zero baseline in standardized feature space."
+)
+
+if st.button("Generate explanation for this sample"):
+    with st.spinner("Calculating Integrated Gradients..."):
+        x_one = torch.tensor(
+            X_scaled[sample_index:sample_index + 1],
+            dtype=torch.float32,
+            device=DEVICE
         )
 
-
-    # ========================================================
-    # NUMERIC VALIDATION
-    # ========================================================
-
-    if (
-        X_selected.isnull().sum().sum()
-        == 0
-    ):
-
-        st.success(
-            "✓ All gene expression values are numeric."
+        attribution_values = integrated_gradients(
+            x_one, predicted_id, steps=32
         )
 
-
-    # ========================================================
-    # CANCER PREDICTION
-    # ========================================================
-
-    st.header("🔬 Cancer Prediction")
-
-    st.success(
-        f"✓ Predictions completed for "
-        f"{len(predictions)} samples."
-    )
-
-
-    # ========================================================
-    # PREDICTION RESULTS TABLE
-    # ========================================================
-
-    st.header("🎯 Prediction Results")
-
-    result_df = pd.DataFrame({
-        "Sample": [
-            f"Sample {i}"
-            for i in range(len(predictions))
-        ],
-        "Predicted Cancer": predictions
-    })
-
-    st.dataframe(
-        result_df,
-        use_container_width=True,
-        height=300
-    )
-
-
-    # ========================================================
-    # PREDICTION SUMMARY
-    # ========================================================
-
-    st.header("📊 Prediction Summary")
-
-    prediction_counts = (
-        pd.Series(predictions)
-        .value_counts()
-        .reindex(
-            classes,
-            fill_value=0
-        )
-    )
-
-    fig, ax = plt.subplots(
-        figsize=(8, 5)
-    )
-
-    ax.bar(
-        prediction_counts.index,
-        prediction_counts.values
-    )
-
-    ax.set_xlabel(
-        "Cancer Type"
-    )
-
-    ax.set_ylabel(
-        "Number of Samples"
-    )
-
-    ax.set_title(
-        "Predicted Cancer Distribution"
-    )
-
-    st.pyplot(
-        fig,
-        clear_figure=True
-    )
-
-
-    # ========================================================
-    # INDIVIDUAL SAMPLE ANALYSIS
-    # ========================================================
-
-    st.header(
-        "🔬 Individual Sample Explanation"
-    )
-
-    sample_options = list(
-        range(len(predictions))
-    )
-
-    selected_sample = st.selectbox(
-        "Select a sample",
-        sample_options,
-        index=min(
-            st.session_state.sample_index,
-            len(sample_options) - 1
-        ),
-        format_func=lambda x: f"Sample {x}",
-        key="individual_sample_selector"
-    )
-
-    # IMPORTANT:
-    # This changes only session state.
-    # The uploaded data and predictions remain stored.
-
-    st.session_state.sample_index = selected_sample
-
-
-    # ========================================================
-    # SELECTED SAMPLE INFORMATION
-    # ========================================================
-
-    selected_prediction = predictions[
-        selected_sample
-    ]
-
-    st.subheader(
-        f"Sample {selected_sample}"
-    )
-
-    st.write(
-        f"**Predicted Cancer:** "
-        f"{selected_prediction}"
-    )
-
-
-    # ========================================================
-    # PROBABILITY TABLE
-    # ========================================================
-
-    st.subheader(
-        "🎯 Prediction Probabilities"
-    )
-
-    sample_probabilities = probabilities[
-        selected_sample
-    ]
-
-    probability_df = pd.DataFrame({
-        "Cancer": classes,
-        "Probability": sample_probabilities
-    })
-
-    probability_df[
-        "Probability (%)"
-    ] = (
-        probability_df["Probability"] * 100
-    ).round(2)
-
-    probability_df = probability_df.sort_values(
-        "Probability",
-        ascending=False
-    )
-
-    st.dataframe(
-        probability_df[
-            [
-                "Cancer",
-                "Probability (%)"
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-    # ========================================================
-    # PROBABILITY CHART
-    # ========================================================
-
-    fig2, ax2 = plt.subplots(
-        figsize=(8, 5)
-    )
-
-    ax2.bar(
-        probability_df["Cancer"],
-        probability_df["Probability (%)"]
-    )
-
-    ax2.set_xlabel(
-        "Cancer Type"
-    )
-
-    ax2.set_ylabel(
-        "Probability (%)"
-    )
-
-    ax2.set_title(
-        f"Sample {selected_sample} Cancer Prediction"
-    )
-
-    ax2.set_ylim(
-        0,
-        100
-    )
-
-    st.pyplot(
-        fig2,
-        clear_figure=True
-    )
-
-
-    # ========================================================
-    # SHAP EXPLANATION
-    # ========================================================
-
-    st.header(
-        "🧠 SHAP Explainability"
-    )
-
-    # --------------------------------------------
-    # MISCLASSIFIED SAMPLE
-    # --------------------------------------------
-
-    misclassified_file = (
-        RESULTS_DIR /
-        "misclassified_sample_shap.csv"
-    )
-
-    # --------------------------------------------
-    # NORMAL SAMPLE SHAP FILE
-    # --------------------------------------------
-
-    individual_shap_file = (
-        RESULTS_DIR /
-        f"sample_{selected_sample}_SHAP.csv"
-    )
-
-
-    # ========================================================
-    # SPECIAL CASE: EXISTING MISCLASSIFIED SAMPLE
-    # ========================================================
-
-    if (
-        selected_sample == 42
-        and misclassified_file.exists()
-    ):
-
-        try:
-
-            shap_df = pd.read_csv(
-                misclassified_file
-            )
-
-            st.subheader(
-                "⚠️ Misclassified Sample Explanation"
-            )
-
-            st.write(
-                "Sample 42 is the misclassified test sample "
-                "identified during final model evaluation."
-            )
-
-            st.write(
-                "**Actual:** LUAD"
-            )
-
-            st.write(
-                "**Predicted:** BRCA"
-            )
-
-            if (
-                "Gene" in shap_df.columns
-                and "SHAP" in shap_df.columns
-            ):
-
-                shap_df[
-                    "Absolute_SHAP"
-                ] = shap_df["SHAP"].abs()
-
-                top_shap = (
-                    shap_df
-                    .sort_values(
-                        "Absolute_SHAP",
-                        ascending=False
-                    )
-                    .head(15)
-                )
-
-                st.subheader(
-                    "Top 15 Contributing Genes"
-                )
-
-                st.dataframe(
-                    top_shap[
-                        [
-                            "Gene",
-                            "SHAP",
-                            "Absolute_SHAP"
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                # ----------------------------------------
-                # SHAP BAR CHART
-                # ----------------------------------------
-
-                plot_df = top_shap.sort_values(
-                    "SHAP"
-                )
-
-                fig3, ax3 = plt.subplots(
-                    figsize=(9, 6)
-                )
-
-                ax3.barh(
-                    plot_df["Gene"],
-                    plot_df["SHAP"]
-                )
-
-                ax3.axvline(
-                    0,
-                    linewidth=1
-                )
-
-                ax3.set_xlabel(
-                    "SHAP Value"
-                )
-
-                ax3.set_ylabel(
-                    "Gene"
-                )
-
-                ax3.set_title(
-                    "Top SHAP Contributions - Sample 42"
-                )
-
-                st.pyplot(
-                    fig3,
-                    clear_figure=True
-                )
-
-            # Existing figure
-            existing_image = (
-                RESULTS_DIR /
-                "SHAP_misclassified_sample_42.png"
-            )
-
-            if existing_image.exists():
-
-                st.subheader(
-                    "Existing SHAP Visualization"
-                )
-
-                st.image(
-                    str(existing_image),
-                    use_container_width=True
-                )
-
-        except Exception as e:
-
-            st.warning(
-                f"Could not load Sample 42 SHAP data: {e}"
-            )
-
-
-    # ========================================================
-    # TRY SAMPLE-SPECIFIC SHAP FILE
-    # ========================================================
-
-    elif individual_shap_file.exists():
-
-        try:
-
-            shap_df = pd.read_csv(
-                individual_shap_file
-            )
-
-            st.subheader(
-                f"SHAP Explanation - Sample {selected_sample}"
-            )
-
-            if (
-                "Gene" in shap_df.columns
-                and "SHAP" in shap_df.columns
-            ):
-
-                shap_df[
-                    "Absolute_SHAP"
-                ] = shap_df["SHAP"].abs()
-
-                top_shap = (
-                    shap_df
-                    .sort_values(
-                        "Absolute_SHAP",
-                        ascending=False
-                    )
-                    .head(15)
-                )
-
-                st.dataframe(
-                    top_shap[
-                        [
-                            "Gene",
-                            "SHAP",
-                            "Absolute_SHAP"
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                plot_df = top_shap.sort_values(
-                    "SHAP"
-                )
-
-                fig4, ax4 = plt.subplots(
-                    figsize=(9, 6)
-                )
-
-                ax4.barh(
-                    plot_df["Gene"],
-                    plot_df["SHAP"]
-                )
-
-                ax4.axvline(
-                    0,
-                    linewidth=1
-                )
-
-                ax4.set_xlabel(
-                    "SHAP Value"
-                )
-
-                ax4.set_ylabel(
-                    "Gene"
-                )
-
-                ax4.set_title(
-                    f"Top SHAP Contributions - "
-                    f"Sample {selected_sample}"
-                )
-
-                st.pyplot(
-                    fig4,
-                    clear_figure=True
-                )
-
-        except Exception as e:
-
-            st.warning(
-                f"Could not load SHAP file: {e}"
-            )
-
-
-    # ========================================================
-    # USE EXISTING SHAP FIGURE FOR SAMPLE 42
-    # ========================================================
-
-    else:
-
-        existing_image = (
-            RESULTS_DIR /
-            "SHAP_global_summary.png"
+        attribution_df = pd.DataFrame({
+            "Gene Feature": selected_genes,
+            "Attribution": attribution_values
+        })
+
+        attribution_df["Absolute Attribution"] = (
+            attribution_df["Attribution"].abs()
         )
 
-        if existing_image.exists():
+        top_df = attribution_df.sort_values(
+            "Absolute Attribution", ascending=False
+        ).head(10)
 
-            st.info(
-                "Individual SHAP values for this sample "
-                "were not saved separately. Showing the "
-                "global SHAP explanation instead."
-            )
-
-            st.image(
-                str(existing_image),
-                use_container_width=True
-            )
-
-        else:
-
-            st.info(
-                "SHAP explanation is not available "
-                "for this sample."
-            )
-
-
-    # ========================================================
-    # GLOBAL TOP GENES
-    # ========================================================
-
-    st.header(
-        "🧬 Global SHAP Gene Importance"
-    )
-
-    global_shap_file = (
-        RESULTS_DIR /
-        "FINAL_GLOBAL_TOP20_SHAP_GENES.csv"
-    )
-
-    if not global_shap_file.exists():
-
-        global_shap_file = (
-            RESULTS_DIR /
-            "global_shap_gene_importance.csv"
+        st.dataframe(
+            top_df[["Gene Feature", "Attribution"]],
+            use_container_width=True,
+            hide_index=True
         )
 
+        plot_df = top_df.sort_values("Attribution")
 
-    if global_shap_file.exists():
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.barh(
+            plot_df["Gene Feature"],
+            plot_df["Attribution"]
+        )
+        ax.axvline(0, linewidth=1)
+        ax.set_xlabel("Integrated Gradients Attribution")
+        ax.set_ylabel("Gene Feature")
+        ax.set_title(
+            f"Top Feature Attributions — Sample {sample_index} "
+            f"({predicted_class})"
+        )
+        fig.tight_layout()
+        st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
 
-        try:
+        csv_data = top_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download sample explanation",
+            data=csv_data,
+            file_name=f"sample_{sample_index}_integrated_gradients.csv",
+            mime="text/csv"
+        )
 
-            global_df = pd.read_csv(
-                global_shap_file
-            )
+# ============================================================
+# GLOBAL FEATURE IMPORTANCE
+# ============================================================
 
-            st.dataframe(
-                global_df.head(20),
-                use_container_width=True,
-                hide_index=True
-            )
+st.header("🌐 Global Feature Importance")
 
-        except Exception as e:
+global_file = EXPLAIN_DIR / "global_gene_importance.csv"
 
-            st.warning(
-                f"Could not load global SHAP data: {e}"
-            )
+if global_file.exists():
+    global_df = pd.read_csv(global_file)
+    st.dataframe(global_df.head(20), use_container_width=True, hide_index=True)
 
-
-    # ========================================================
-    # FOOTER
-    # ========================================================
-
-    st.markdown("---")
-
-    st.markdown(
-        """
-        <div style="text-align:center">
-
-        <b>GenoInsight</b> |
-        Explainable AI for RNA-Seq Cancer Prediction
-
-        </div>
-        """,
-        unsafe_allow_html=True
+    gene_col = next(
+        (c for c in ["gene", "Gene", "feature", "Feature"]
+         if c in global_df.columns),
+        None
+    )
+    score_col = next(
+        (c for c in ["mean_absolute_attribution", "mean_abs_attribution",
+                     "mean_absolute_ig", "importance"]
+         if c in global_df.columns),
+        None
     )
 
-
+    if gene_col and score_col:
+        plot_df = global_df.head(15).sort_values(score_col)
+        fig, ax = plt.subplots(figsize=(9, 6))
+        ax.barh(plot_df[gene_col], plot_df[score_col])
+        ax.set_xlabel("Mean Absolute Attribution")
+        ax.set_title("Global Integrated Gradients Feature Importance")
+        fig.tight_layout()
+        st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
 else:
-
     st.info(
-        "👆 Upload an RNA-Seq CSV file to begin prediction."
+        "Global attribution file not found. Individual explanations "
+        "can still be generated above."
     )
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+st.markdown(
+    "<div style='text-align:center'><b>GenoInsight</b> | "
+    "VAE + DNN with Integrated Gradients</div>",
+    unsafe_allow_html=True
+)
